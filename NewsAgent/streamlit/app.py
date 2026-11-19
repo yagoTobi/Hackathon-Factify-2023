@@ -11,7 +11,12 @@ st.markdown("<h1 style='text-align: center; color: black; margin-bottom: 2rem;'>
 col1, col2 = st.columns([0.8, 0.2], gap="small")
 
 with col1:
-    user_query = st.text_input("", placeholder="Enter your query here...", key="search_input")
+    user_query = st.text_input(
+        "Search Query",
+        placeholder="Enter your query here (e.g. Clean Energy Transition)...",
+        key="search_input",
+        label_visibility="collapsed"
+    )
 
 with col2:
     search_button = st.button("Search", key="search_button")

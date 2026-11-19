@@ -1,12 +1,33 @@
-import os 
+import os
+import json
+import re
+import math
 from dotenv import load_dotenv
-from langchain.chains import LLMChain
+try:
+    from langchain.chains import LLMChain
+except ImportError:
+    class LLMChain:
+        def __init__(self, llm, prompt):
+            self.chain = prompt | llm
+        def invoke(self, input):
+            res = self.chain.invoke(input)
+            raw = res.content if hasattr(res, "content") else res
+            if isinstance(raw, list):
+                text = "".join([b.get("text", "") for b in raw if isinstance(b, dict)])
+            elif isinstance(raw, dict):
+                text = raw.get("text", str(raw))
+            else:
+                text = str(raw)
+            return {"text": text.strip()}
 from langchain_core.prompts import PromptTemplate
 from query_constructor import llm_connect
 from news_extractor import obtain_articles_from_query
 import concurrent.futures
 
+# Load environment variables from both NewsAgent/.env and root .env
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 def extract_facts_prompt(user_query, article):
     template: str = """
@@ -141,24 +162,161 @@ def create_stories_prompt(user_query, bullet_point_articles):
 
     return prompt_template
 
+
+def batch_classify_slant_prompt():
+    template = """
+Objective: Evaluate the political slant and ideological extremism of a cohort of news articles relative to each other.
+Use the articles as mutual reference anchors to assess relative framing, rhetoric, and tone.
+
+Input Articles:
+{articles_text}
+
+Instructions:
+1. For each article, determine:
+   - "id": The integer ID corresponding to the article index [0, 1, 2, ...].
+   - "slant_score": Float from -1.0 (Far Left) to 1.0 (Far Right), where 0.0 is Center/Neutral/Objective.
+   - "category": One of "left", "center", or "right". (Use "center" if slant is between -0.2 and 0.2).
+   - "extremism_score": Float from 0.0 (Mainstream, balanced, evidence-based reporting) to 1.0 (Extreme, highly partisan rhetoric, unsubstantiated conspiracy, or inflammatory propaganda).
+   - "reasoning": 1 concise sentence explaining the placement relative to other articles in the cohort.
+2. Output MUST be a strictly valid JSON array of objects with keys: "id", "slant_score", "category", "extremism_score", "reasoning".
+Do not include any text, markdown preamble, or explanations outside the JSON array.
+"""
+    return PromptTemplate(template=template, input_variables=["articles_text"])
+
+
+def parse_json_from_llm(text):
+    if not text:
+        return None
+    text = text.strip()
+    match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            pass
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def batch_classify_articles(articles_dict):
+    """
+    Classifies political slant and extremism for all articles in a single LLM call.
+    Uses relative anchoring so articles serve as mutual references.
+    """
+    if not articles_dict:
+        return []
+
+    articles_text_blocks = []
+    for i, art in enumerate(articles_dict):
+        source = art.get('source', {}).get('name', 'Unknown Source') if isinstance(art.get('source'), dict) else str(art.get('source', 'Unknown Source'))
+        title = art.get('title', 'No Title')
+        summary = art.get('summary') or art.get('description') or (art.get('text', '')[:300])
+        articles_text_blocks.append(f"[{i}] Source: {source}\nTitle: {title}\nSummary: {summary}\n")
+
+    combined_text = "\n".join(articles_text_blocks)
+    chain = LLMChain(
+        llm=llm_connect(model_name="gemini-3.1-flash-lite", temperature=0.0),
+        prompt=batch_classify_slant_prompt()
+    )
+
+    try:
+        response = chain.invoke(input={"articles_text": combined_text})
+        parsed_results = parse_json_from_llm(response.get("text", ""))
+    except Exception as e:
+        print(f"Batch classification error: {e}")
+        parsed_results = None
+
+    scores_by_id = {}
+    if parsed_results and isinstance(parsed_results, list):
+        for item in parsed_results:
+            if isinstance(item, dict) and "id" in item:
+                scores_by_id[item["id"]] = item
+
+    # Map scores back to articles with robust fallbacks
+    for i, art in enumerate(articles_dict):
+        score_data = scores_by_id.get(i, {})
+        art['slant_score'] = float(score_data.get('slant_score', 0.0))
+        art['category'] = str(score_data.get('category', 'center')).lower()
+        art['extremism_score'] = float(score_data.get('extremism_score', 0.1))
+        art['bias_reasoning'] = str(score_data.get('reasoning', 'Default anchor'))
+
+    return articles_dict
+
+
+def filter_and_balance_proportions(classified_articles, max_proportion=0.40, extremism_threshold=0.85):
+    """
+    1. Filters out extreme outliers where extremism_score > threshold or |slant_score| > threshold.
+    2. Buckets surviving articles into left, center, right.
+    3. Caps any bucket at max_proportion (default 40%) of surviving articles, prioritizing the least extreme sources.
+    """
+    if not classified_articles:
+        return []
+
+    # Step 1: Discard extreme outliers beyond threshold
+    survivors = []
+    for art in classified_articles:
+        ext = art.get('extremism_score', 0.0)
+        slant = abs(art.get('slant_score', 0.0))
+        if ext <= extremism_threshold and slant <= extremism_threshold:
+            survivors.append(art)
+        else:
+            title = art.get('title', 'Unknown')
+            print(f"Pruned extremist outlier: '{title}' (extremism={ext}, slant={art.get('slant_score')})")
+
+    if not survivors:
+        # Fallback to least extreme original article if all were filtered
+        return [min(classified_articles, key=lambda a: a.get('extremism_score', 1.0))]
+
+    # Step 2: Bucket into left, center, right
+    buckets = {'left': [], 'center': [], 'right': []}
+    for art in survivors:
+        cat = art.get('category', 'center').lower()
+        if cat in buckets:
+            buckets[cat].append(art)
+        else:
+            buckets['center'].append(art)
+
+    # Step 3: Enforce proportional cap
+    total_survivors = len(survivors)
+    max_count = max(1, math.ceil(total_survivors * max_proportion))
+
+    balanced_articles = []
+    for cat in ['left', 'center', 'right']:
+        articles_in_bucket = buckets[cat]
+        if len(articles_in_bucket) > max_count:
+            # Sort by lowest extremism first, then lowest absolute slant to select highest quality sources
+            articles_in_bucket.sort(key=lambda a: (a.get('extremism_score', 0.0), abs(a.get('slant_score', 0.0))))
+            balanced_articles.extend(articles_in_bucket[:max_count])
+        else:
+            balanced_articles.extend(articles_in_bucket)
+
+    return balanced_articles
+
+
 def generate_article(user_query, bullet_point_dictionary): 
     chain = LLMChain(
-        llm=llm_connect(model_name='gpt-4-turbo-preview', temperature=0.23), prompt=create_stories_prompt(user_query, bullet_point_dictionary)
+        llm=llm_connect(model_name='gemini-3.1-flash-lite', temperature=0.2), prompt=create_stories_prompt(user_query, bullet_point_dictionary)
     )
     response = chain.invoke(input={"user_query": user_query, "bullet_point_dictionary": bullet_point_dictionary})
     return response["text"]
 
 
-def generate_final_article(user_query):
+def generate_final_article(user_query, max_proportion=0.40, extremism_threshold=0.85):
     #user_query = 'Climate Change'
     articles_dict = obtain_articles_from_query(user_query)
-    bullet_point_dict = article_bullet_points_parallel(user_query, articles_dict)
+    classified = batch_classify_articles(articles_dict)
+    balanced_articles = filter_and_balance_proportions(classified, max_proportion, extremism_threshold)
+    bullet_point_dict = article_bullet_points_parallel(user_query, balanced_articles)
     final_article = generate_article(user_query, bullet_point_dict)
     #print(final_article)
     return final_article
 
-def generate_article_from_articles(user_query, articles_dict):
-    bullet_point_dict = article_bullet_points_parallel(user_query, articles_dict)
+def generate_article_from_articles(user_query, articles_dict, max_proportion=0.40, extremism_threshold=0.85):
+    classified = batch_classify_articles(articles_dict)
+    balanced_articles = filter_and_balance_proportions(classified, max_proportion, extremism_threshold)
+    bullet_point_dict = article_bullet_points_parallel(user_query, balanced_articles)
     final_article = generate_article(user_query, bullet_point_dict)
     #print(final_article)
     return final_article

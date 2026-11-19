@@ -1,18 +1,83 @@
 import os
+import re
 from dotenv import load_dotenv
-from langchain.chains import LLMChain
-from langchain_openai import ChatOpenAI
+try:
+    from langchain.chains import LLMChain
+except ImportError:
+    class LLMChain:
+        def __init__(self, llm, prompt):
+            self.chain = prompt | llm
+        def invoke(self, input):
+            res = self.chain.invoke(input)
+            raw = res.content if hasattr(res, "content") else res
+            if isinstance(raw, list):
+                # Handle structured blocks like [{'type': 'text', 'text': '...'}]
+                text = "".join([b.get("text", "") for b in raw if isinstance(b, dict)])
+            elif isinstance(raw, dict):
+                text = raw.get("text", str(raw))
+            else:
+                text = str(raw)
+            return {"text": text.strip()}
 from langchain_core.prompts import PromptTemplate
 from datetime import date
 
+# Import LLM providers with graceful fallbacks
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError:
+    ChatGoogleGenerativeAI = None
+
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:
+    ChatOpenAI = None
+
+# Load environment variables from both NewsAgent/.env and root .env
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 
-def llm_connect(model_name="gpt-3.5-turbo", temperature='0'):
-    llm = ChatOpenAI(
-        temperature=temperature, model_name=model_name, api_key=os.getenv("OPENAI_API_KEY")
-    )
-    return llm
+def llm_connect(model_name="gemini-3.1-flash-lite", temperature=0.0):
+    """
+    Connects to the appropriate LLM provider.
+    Prefers Gemini (gemini-3.1-flash-lite) if GEMINI_API_KEY or GOOGLE_API_KEY is present,
+    falling back to OpenAI if OPENAI_API_KEY is present.
+    """
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+
+    # Override model if specified in environment
+    target_model = os.getenv("GEMINI_MODEL") or model_name
+
+    # If gemini key exists or model requested is gemini, use Gemini
+    if (gemini_key or "gemini" in str(target_model).lower()) and ChatGoogleGenerativeAI is not None:
+        return ChatGoogleGenerativeAI(
+            model=target_model if "gemini" in str(target_model).lower() else "gemini-3.1-flash-lite",
+            temperature=float(temperature),
+            google_api_key=gemini_key
+        )
+
+    # Fallback to OpenAI if configured
+    if openai_key and ChatOpenAI is not None:
+        fallback_model = "gpt-3.5-turbo" if "gemini" in str(target_model).lower() else target_model
+        return ChatOpenAI(
+            temperature=float(temperature),
+            model_name=fallback_model,
+            api_key=openai_key
+        )
+
+    # Default to Gemini attempt
+    if ChatGoogleGenerativeAI is not None:
+        return ChatGoogleGenerativeAI(
+            model="gemini-3.1-flash-lite",
+            temperature=float(temperature),
+            google_api_key=gemini_key
+        )
+    elif ChatOpenAI is not None:
+        return ChatOpenAI(temperature=float(temperature), model_name="gpt-3.5-turbo", api_key=openai_key)
+    else:
+        raise RuntimeError("No LLM provider library available. Install langchain-google-genai or langchain-openai.")
 
 
 def generate_url_prompt(user_query, today_date):
@@ -59,7 +124,19 @@ def generate_search_url(user_query):
     )
     # Run the chain to get the response
     response = chain.invoke(input={"user_query": user_query, "today_date": today_date})
-    return response["text"]
+    raw_text = response["text"] if isinstance(response, dict) and "text" in response else str(response)
+
+    # In case response is a list or contains markdown
+    if isinstance(raw_text, list):
+        raw_text = "".join([b.get("text", "") if isinstance(b, dict) else str(b) for b in raw_text])
+    else:
+        raw_text = str(raw_text)
+
+    # Extract clean http(s) URL if wrapped in extra text or quotes
+    match = re.search(r'https?://[^\s\'"<>]+', raw_text)
+    if match:
+        return match.group(0).strip()
+    return raw_text.strip()
 
 
 if __name__ == "__main__":
