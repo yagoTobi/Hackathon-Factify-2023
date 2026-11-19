@@ -7,12 +7,20 @@ from newspaper import Article
 from dotenv import load_dotenv
 from query_constructor import generate_search_url
 
+# Load environment variables from both NewsAgent/.env and root .env
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 
 def get_articles(query):
     # TODO - Uncomment for real demo, right now, we want to save on API usage
     search_url = generate_search_url(query)
+    # Ensure search_url is a pure string
+    if isinstance(search_url, list):
+        search_url = "".join([b.get("text", "") if isinstance(b, dict) else str(b) for b in search_url])
+    search_url = str(search_url).strip()
+
     complete_url = search_url + f"&apiKey={os.getenv('NEWSAPI_KEY')}"
     #complete_url = "https://newsapi.org/v2/everything?q=US economy&from=2024-02-23&to=2024-02-29&sortBy=popularity&language=en&pageSize=10&apiKey=6ddc83d9e2974d0fabbac57924805fa3"
     print(complete_url)
@@ -36,8 +44,12 @@ def extract_article_data(url):
         article = Article(url)
         article.download()
         article.parse()
-        article.nlp()
-        return {"text": article.text, "top_image": article.top_image}
+        try:
+            article.nlp()
+            summary = article.summary
+        except Exception:
+            summary = ""
+        return {"text": article.text, "top_image": article.top_image, "summary": summary}
     except Exception as e:
         print(f"Error processing {url}: {e}")
         return None
@@ -82,7 +94,8 @@ def process_articles_concurrently(articles_dict):
                 if data:
                     article["text"] = data["text"]
                     article["top_image"] = data["top_image"]
-                    article["summary"] = get_maisa_summarize(article["text"])
+                    # Use extractive NLP summary from newspaper3k with fallback to description or snippet
+                    article["summary"] = data.get("summary") or article.get("description", "") or data["text"][:400]
             except Exception as exc:
                 print(f"Article at {article['url']} generated an exception: {exc}")
 
